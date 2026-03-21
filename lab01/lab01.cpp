@@ -8,7 +8,6 @@
 using namespace std;
 
 static volatile double g_sink = 0.0;
-// label me или vg adapter (vgg version 2) и методы оценки качества локализации
 static inline uint64_t rdtsc_start() {
     unsigned int eax, ebx, ecx, edx;
     eax = 0;
