@@ -1,204 +1,156 @@
-#include <algorithm>
-#include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
-#include <iostream>
-#include <numeric>
-#include <random>
-#include <string>
-#include <vector>
+#include <cstdlib>
+#include <chrono>
 
-static inline void compiler_barrier() { asm volatile("" ::: "memory"); }
+enum Pattern { SEQ, RND, IDX };
 
-using clk = std::chrono::steady_clock;
+static const char* patName(Pattern p) {
+    if (p == SEQ) return "sequential";
+    if (p == RND) return "random_pointer_chase";
+    return "random_with_index_array";
+}
 
+static Pattern parsePattern(const char* s) {
+    if (strcmp(s, "seq") == 0) return SEQ;
+    if (strcmp(s, "rnd") == 0) return RND;
+    if (strcmp(s, "idx") == 0) return IDX;
 
-enum class Pattern {
-    Sequential = 0,
-    RandomPointerChase = 1,
-    RandomWithIndexArray = 2
-};
+    printf("Unknown pattern: %s (use seq|rnd|idx)\n", s);
+    exit(1);
+}
 
+static const int MAX_MB = 150;
+static const size_t MAX_BYTES = (size_t)MAX_MB * 1024ull * 1024ull;
+static const size_t MAX_N = MAX_BYTES / sizeof(double);
 
-static std::string pattern_name(Pattern p) {
-    switch (p) {
-        case Pattern::Sequential: return "sequential";
-        case Pattern::RandomPointerChase: return "random_pointer_chase";
-        case Pattern::RandomWithIndexArray: return "random_with_index_array";
+alignas (64) static double   A[MAX_N];
+alignas (64) static uint32_t P[MAX_N];
+
+static volatile double sink = 0.0;
+
+static inline uint64_t xorshift64(uint64_t& x) {
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    return x * 2685821657736338717ULL;
+}
+
+static void makePermutation(uint32_t* p, uint32_t n, uint64_t seed) {
+    for (uint32_t i = 0; i < n; i++) p[i] = i;
+
+    uint64_t s = seed ? seed : 1234567ULL;
+    for (uint32_t i = n - 1; i > 0; i--) {
+        uint32_t j = (uint32_t)(xorshift64(s) % (uint64_t)(i + 1));
+        uint32_t tmp = p[i];
+        p[i] = p[j];
+        p[j] = tmp;
     }
-    return "unknown";
 }
 
+static void permToNext(uint32_t* p, uint32_t n) {
+    const uint32_t MARK = 0x80000000u;
 
-static volatile double g_sink = 0.0;
+    uint32_t first = p[0];
+    for (uint32_t i = 0; i + 1 < n; i++) {
+        uint32_t from = p[i];
+        uint32_t to   = p[i + 1];
+        p[from] = (to | MARK);
+    }
+    uint32_t last = p[n - 1];
+    p[last] = (first | MARK);
 
-
-static std::vector<uint32_t> make_permutation(uint32_t n, uint64_t seed) {
-    std::vector<uint32_t> p(n);
-    std::iota(p.begin(), p.end(), 0u);
-    std::mt19937_64 rng(seed);
-    std::shuffle(p.begin(), p.end(), rng);
-    return p;
+    for (uint32_t i = 0; i < n; i++) p[i] &= ~MARK;
 }
 
-
-static std::vector<uint32_t> make_cycle_next(const std::vector<uint32_t>& perm) {
-    uint32_t n = (uint32_t)perm.size();
-    std::vector<uint32_t> next(n);
-    for (uint32_t i = 0; i + 1 < n; i++) next[perm[i]] = perm[i + 1];
-    next[perm[n - 1]] = perm[0];
-    return next;
+static void touchData(const double* a, size_t n) {
+    double s = 0.0;
+    size_t step = 64 / sizeof(double);
+    for (size_t i = 0; i < n; i += step) s += a[i];
+    sink = s;
 }
 
-
-static void touch(const std::vector<double>& a) {
-    double s = 0;
-    for (size_t i = 0; i < a.size(); i += 64 / sizeof(double)) s += a[i];
-    g_sink = s;
+static size_t chooseRepeats(size_t n) {
+    double target_ms = 200.0;
+    double est_ns = (double)n * 5.0; // грубо
+    size_t r = (size_t)((target_ms * 1e6) / est_ns);
+    if (r < 1) r = 1;
+    if (r > 2000) r = 2000;
+    return r;
 }
 
-struct Result {
-    double ns_per_iter = 0.0;
-    double ns_total = 0.0;
-    double sum = 0.0;
-};
-
-static Result run_sum(
-    const std::vector<double>& a,
-    const std::vector<uint32_t>& idx,
-    const std::vector<uint32_t>& next,
-    Pattern pattern,
-    size_t repeats
-) {
-    const size_t n = a.size();
-
-    compiler_barrier();
+static double measureNsPerIter(Pattern pat, size_t n, size_t repeats) {
+    using clk = std::chrono::steady_clock;
 
     auto t0 = clk::now();
     double total = 0.0;
 
-    if (pattern == Pattern::Sequential) {
+    if (pat == SEQ) {
         for (size_t r = 0; r < repeats; r++) {
             double s = 0.0;
-            for (size_t i = 0; i < n; i++) s += a[i];
+            for (size_t i = 0; i < n; i++) s += A[i];
             total += s;
         }
-    } else if (pattern == Pattern::RandomWithIndexArray) {
-
+    } else if (pat == IDX) {
         for (size_t r = 0; r < repeats; r++) {
             double s = 0.0;
-            for (size_t i = 0; i < n; i++) s += a[idx[i]];
+            for (size_t i = 0; i < n; i++) s += A[P[i]];
             total += s;
         }
-    } else { // RandomPointerChase
-
+    } else { // RND pointer chase
         for (size_t r = 0; r < repeats; r++) {
             double s = 0.0;
             uint32_t cur = 0;
             for (size_t i = 0; i < n; i++) {
-                cur = next[cur];
-                s += a[cur];
+                cur = P[cur];
+                s += A[cur];
             }
             total += s;
         }
     }
 
     auto t1 = clk::now();
-    compiler_barrier();
+    sink = total;
 
     std::chrono::duration<double> dt = t1 - t0;
     double ns_total = dt.count() * 1e9;
-    double iters_total = double(n) * double(repeats);
-    double ns_per_iter = ns_total / iters_total;
-
-    g_sink = total; // не дать выкинуть
-    return {ns_per_iter, ns_total, total};
-}
-
-
-static size_t choose_repeats(size_t n, double target_ms = 30.0) {
-
-    double est_ns = double(n) * 2.0;
-    double target_ns = target_ms * 1e6;
-    size_t r = (size_t)std::max(1.0, target_ns / est_ns);
-
-    if (r > 2000) {
-        r = 2000;
-    }
-    return r;
-}
-
-
-static void run_range(size_t max_bytes, size_t step_bytes, Pattern pattern, uint64_t seed) {
-    std::cout << "pattern,bytes,n_elems,repeats,ns_per_iter\n";
-
-    for (size_t bytes = step_bytes; bytes <= max_bytes; bytes += step_bytes) {
-        size_t n = bytes / sizeof(double);
-        if (n < 2) continue;
-
-        std::vector<double> a(n);
-
-        for (size_t i = 0; i < n; i++) a[i] = double(i % 1024) * 0.25 + 1.0;
-
-        std::vector<uint32_t> idx;
-        std::vector<uint32_t> next;
-
-        if (pattern == Pattern::RandomWithIndexArray || pattern == Pattern::RandomPointerChase) {
-            auto perm = make_permutation((uint32_t)n, seed ^ (uint64_t)bytes);
-            if (pattern == Pattern::RandomWithIndexArray) {
-                idx = std::move(perm); // просто перестановка
-            } else {
-                next = make_cycle_next(perm);
-            }
-        }
-
-        touch(a);
-        if (!idx.empty()) {
-            volatile uint32_t t = 0;
-            for (size_t i = 0; i < idx.size(); i += 16) t ^= idx[i];
-            (void)t;
-        }
-        if (!next.empty()) {
-            volatile uint32_t t = 0;
-            for (size_t i = 0; i < next.size(); i += 16) t ^= next[i];
-            (void)t;
-        }
-
-        size_t warm_repeats = 2;
-        (void)run_sum(a, idx, next, pattern, warm_repeats);
-
-        size_t repeats = choose_repeats(n);
-        auto res = run_sum(a, idx, next, pattern, repeats);
-
-        std::cout
-            << pattern_name(pattern) << ","
-            << bytes << ","
-            << n << ","
-            << repeats << ","
-            << res.ns_per_iter
-            << "\n";
-    }
+    return ns_total / ((double)n * (double)repeats);
 }
 
 int main(int argc, char** argv) {
-    // cache_latency <pattern> <max_mb> <step_kb>
-
-    std::string p = argv[1];
-    double max_mb = std::stod(argv[2]);
-    double step_kb = std::stod(argv[3]);
-
-    Pattern pattern;
-    if (p == "seq") pattern = Pattern::Sequential;
-    else if (p == "rnd") pattern = Pattern::RandomPointerChase;
-    else if (p == "idx") pattern = Pattern::RandomWithIndexArray;
-    else {
-        std::cerr << "Unknown pattern. Use seq|rnd|idx\n";
-        return 1;
-    }
+    Pattern pat = parsePattern(argv[1]);
+    double max_mb = atof(argv[2]);
+    double step_kb = atof(argv[3]);
 
     size_t max_bytes = (size_t)(max_mb * 1024.0 * 1024.0);
     size_t step_bytes = (size_t)(step_kb * 1024.0);
 
-    run_range(max_bytes, step_bytes, pattern, 123456789ULL);
+    printf("pattern,bytes,n_elems,repeats,ns_per_iter\n");
+
+    for (size_t bytes = step_bytes; bytes <= max_bytes; bytes += step_bytes) {
+        size_t n = bytes / sizeof(double);
+        if (n < 2) {
+            continue;
+        }
+
+        for (size_t i = 0; i < n; i++) {
+            A[i] = (double)(i % 1024) * 0.25 + 1.0;
+        }
+
+        if (pat == IDX || pat == RND) {
+            makePermutation(P, (uint32_t)n, 123456789ULL ^ (uint64_t)bytes);
+            if (pat == RND) permToNext(P, (uint32_t)n);
+        }
+
+        touchData(A, n);
+        (void) measureNsPerIter(pat, n, 2);
+
+        size_t repeats = chooseRepeats(n);
+        double ns = measureNsPerIter(pat, n, repeats);
+
+        printf("%s,%zu,%zu,%zu,%.6f\n", patName(pat), bytes, n, repeats, ns);
+    }
+
     return 0;
 }
