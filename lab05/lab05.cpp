@@ -4,133 +4,145 @@
 #include <chrono>
 #include <iostream>
 #include <iomanip>
-#include <cstring>
 
-#include <mmintrin.h> // __m64, _mm_*
+#include <immintrin.h>
 
-static constexpr size_t N = 1'000'000;
+static constexpr size_t N = 999968;
 
 
-void fill_input(std::vector<int8_t>& a, std::vector<int8_t>& b, uint32_t seed = 42) {
+void fill_input(std::vector<int8_t>& a, uint32_t seed = 42) {
     std::mt19937 rng(seed);
     std::uniform_int_distribution<int> dist(-128, 127);
-    for (size_t i = 0; i < a.size(); ++i) {
+    for (size_t i = 0; i < a.size(); ++i)
         a[i] = static_cast<int8_t>(dist(rng));
-        b[i] = static_cast<int8_t>(dist(rng));
-    }
 }
 
 
-void mul_scalar(const int8_t* a, const int8_t* b, int16_t* c, size_t n) {
-    for (size_t i = 0; i < n; ++i)
-        c[i] = static_cast<int16_t>(a[i]) * static_cast<int16_t>(b[i]);
+int64_t sum_scalar(const int8_t* a, size_t n) {
+    int64_t s = 0;
+    for (size_t i = 0; i < n; ++i) s += (int64_t)a[i];
+    return s;
 }
 
 
-static inline void mmx_mul8_store16(const int8_t* a, const int8_t* b, int16_t* c) {
-    __m64 va = *reinterpret_cast<const __m64*>(a);
-    __m64 vb = *reinterpret_cast<const __m64*>(b);
+int64_t sum_avx2(const int8_t* a, size_t n) {
+    __m256i acc32 = _mm256_setzero_si256(); // 8x int32
 
-    const __m64 zero = _mm_setzero_si64();
+    for (size_t i = 0; i < n; i += 32) {
+        __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i));
 
-    __m64 sa = _mm_cmpgt_pi8(zero, va);
-    __m64 sb = _mm_cmpgt_pi8(zero, vb);
+        __m128i lo128 = _mm256_castsi256_si128(v);
+        __m128i hi128 = _mm256_extracti128_si256(v, 1);
 
-    __m64 a_lo = _mm_unpacklo_pi8(va, sa);
-    __m64 a_hi = _mm_unpackhi_pi8(va, sa);
-    __m64 b_lo = _mm_unpacklo_pi8(vb, sb);
-    __m64 b_hi = _mm_unpackhi_pi8(vb, sb);
+        __m256i lo16 = _mm256_cvtepi8_epi16(lo128); // 16x int16
+        __m256i hi16 = _mm256_cvtepi8_epi16(hi128); // 16x int16
 
-    __m64 p_lo = _mm_mullo_pi16(a_lo, b_lo);
-    __m64 p_hi = _mm_mullo_pi16(a_hi, b_hi);
+        __m128i lo16a = _mm256_castsi256_si128(lo16);
+        __m128i lo16b = _mm256_extracti128_si256(lo16, 1);
+        __m128i hi16a = _mm256_castsi256_si128(hi16);
+        __m128i hi16b = _mm256_extracti128_si256(hi16, 1);
 
-    *reinterpret_cast<__m64*>(c + 0) = p_lo;
-    *reinterpret_cast<__m64*>(c + 4) = p_hi;
-}
-
-
-void mul_mmx(const int8_t* a, const int8_t* b, int16_t* c, size_t n) {
-    size_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        mmx_mul8_store16(a + i, b + i, c + i);
+        acc32 = _mm256_add_epi32(acc32, _mm256_cvtepi16_epi32(lo16a));
+        acc32 = _mm256_add_epi32(acc32, _mm256_cvtepi16_epi32(lo16b));
+        acc32 = _mm256_add_epi32(acc32, _mm256_cvtepi16_epi32(hi16a));
+        acc32 = _mm256_add_epi32(acc32, _mm256_cvtepi16_epi32(hi16b));
     }
 
-    for (; i < n; ++i) {
-        c[i] = static_cast<int16_t>(a[i]) * static_cast<int16_t>(b[i]);
-    }
+    alignas(32) int32_t tmp[8];
+    _mm256_store_si256(reinterpret_cast<__m256i*>(tmp), acc32);
 
-    _mm_empty();
+    int64_t s = 0;
+    for (int k = 0; k < 8; ++k) {
+        s += tmp[k];
+    }
+    return s;
 }
 
 
 template<int UNROLL>
-void mul_mmx_unroll(const int8_t* a, const int8_t* b, int16_t* c, size_t n) {
-    constexpr size_t VEC = 8;
+int64_t sum_avx2_unroll(const int8_t* a, size_t n) {
+    constexpr size_t VEC = 32;
     constexpr size_t STEP = UNROLL * VEC;
 
-    size_t i = 0;
-    for (; i + STEP <= n; i += STEP) {
+    __m256i acc32 = _mm256_setzero_si256();
+
+    for (size_t i = 0; i < n; i += STEP) {
         #pragma unroll
-        for (int k = 0; k < UNROLL; ++k) {
-            mmx_mul8_store16(a + i + k * VEC, b + i + k * VEC, c + i + k * VEC);
+        for (int u = 0; u < UNROLL; ++u) {
+            const int8_t* p = a + i + u * VEC;
+            __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+
+            __m128i lo128 = _mm256_castsi256_si128(v);
+            __m128i hi128 = _mm256_extracti128_si256(v, 1);
+
+            __m256i lo16 = _mm256_cvtepi8_epi16(lo128);
+            __m256i hi16 = _mm256_cvtepi8_epi16(hi128);
+
+            __m128i lo16a = _mm256_castsi256_si128(lo16);
+            __m128i lo16b = _mm256_extracti128_si256(lo16, 1);
+            __m128i hi16a = _mm256_castsi256_si128(hi16);
+            __m128i hi16b = _mm256_extracti128_si256(hi16, 1);
+
+            acc32 = _mm256_add_epi32(acc32, _mm256_cvtepi16_epi32(lo16a));
+            acc32 = _mm256_add_epi32(acc32, _mm256_cvtepi16_epi32(lo16b));
+            acc32 = _mm256_add_epi32(acc32, _mm256_cvtepi16_epi32(hi16a));
+            acc32 = _mm256_add_epi32(acc32, _mm256_cvtepi16_epi32(hi16b));
         }
     }
 
-    for (; i < n; ++i)
-        c[i] = static_cast<int16_t>(a[i]) * static_cast<int16_t>(b[i]);
+    alignas(32) int32_t tmp[8];
+    _mm256_store_si256(reinterpret_cast<__m256i*>(tmp), acc32);
 
-    _mm_empty();
-}
-
-
-bool equal_arrays(const std::vector<int16_t>& x, const std::vector<int16_t>& y) {
-    return x.size() == y.size() && std::memcmp(x.data(), y.data(), x.size() * sizeof(int16_t)) == 0;
+    int64_t s = 0;
+    for (int k = 0; k < 8; ++k) {
+        s += tmp[k];
+    }
+    return s;
 }
 
 
 template<class F>
-double bench_ms(F&& fn, int iters = 30) {
+double bench_ms(F&& fn, int iters = 50) {
     using clock = std::chrono::steady_clock;
-    fn();
+    volatile int64_t sink = 0;
+
+    sink ^= fn(); // warm up
 
     auto t0 = clock::now();
-    for (int i = 0; i < iters; ++i) {
-        fn();
-    }
+    for (int i = 0; i < iters; ++i) sink ^= fn();
     auto t1 = clock::now();
 
+    (void) sink;
     std::chrono::duration<double, std::milli> dt = t1 - t0;
     return dt.count() / iters;
 }
 
 
 int main() {
-    std::vector<int8_t>  a(N), b(N);
-    std::vector<int16_t> c0(N), c1(N), c2(N), c4(N), c8(N);
+    std::vector<int8_t> a(N);
+    fill_input(a, 42);
 
-    fill_input(a, b, 42); // seed = 42
+    int64_t s0 = sum_scalar(a.data(), N);
+    int64_t s1 = sum_avx2(a.data(), N);
+    int64_t s2 = sum_avx2_unroll<2>(a.data(), N);
+    int64_t s4 = sum_avx2_unroll<4>(a.data(), N);
+    int64_t s8 = sum_avx2_unroll<8>(a.data(), N);
 
-    mul_scalar(a.data(), b.data(), c0.data(), N);
-    mul_mmx(a.data(), b.data(), c1.data(), N);
-    mul_mmx_unroll<2>(a.data(), b.data(), c2.data(), N);
-    mul_mmx_unroll<4>(a.data(), b.data(), c4.data(), N);
-    mul_mmx_unroll<8>(a.data(), b.data(), c8.data(), N);
+    std::cout << "AVX2          == scalar: " << (s1 == s0 ? "YES" : "NO") << std::endl;
+    std::cout << "AVX2 unroll2  == scalar: " << (s2 == s0 ? "YES" : "NO") << std::endl;
+    std::cout << "AVX2 unroll4  == scalar: " << (s4 == s0 ? "YES" : "NO") << std::endl;
+    std::cout << "AVX2 unroll8  == scalar: " << (s8 == s0 ? "YES" : "NO") << std::endl;
 
-    std::cout << "MMX         = scalar: " << (equal_arrays(c1, c0) ? "YES" : "NO") << std::endl;
-    std::cout << "MMX unroll2 = scalar: " << (equal_arrays(c2, c0) ? "YES" : "NO") << std::endl;
-    std::cout << "MMX unroll4 = scalar: " << (equal_arrays(c4, c0) ? "YES" : "NO") << std::endl;
-    std::cout << "MMX unroll8 = scalar: " << (equal_arrays(c8, c0) ? "YES" : "NO") << std::endl;
-
-    auto t_scalar = bench_ms([&]{ mul_scalar(a.data(), b.data(), c0.data(), N); });
-    auto t_mmx    = bench_ms([&]{ mul_mmx(a.data(), b.data(), c1.data(), N); });
-    auto t_u2     = bench_ms([&]{ mul_mmx_unroll<2>(a.data(), b.data(), c2.data(), N); });
-    auto t_u4     = bench_ms([&]{ mul_mmx_unroll<4>(a.data(), b.data(), c4.data(), N); });
-    auto t_u8     = bench_ms([&]{ mul_mmx_unroll<8>(a.data(), b.data(), c8.data(), N); });
+    auto t_scalar = bench_ms([&]{ return sum_scalar(a.data(), N); });
+    auto t_avx2   = bench_ms([&]{ return sum_avx2(a.data(), N); });
+    auto t_u2     = bench_ms([&]{ return sum_avx2_unroll<2>(a.data(), N); });
+    auto t_u4     = bench_ms([&]{ return sum_avx2_unroll<4>(a.data(), N); });
+    auto t_u8     = bench_ms([&]{ return sum_avx2_unroll<8>(a.data(), N); });
 
     std::cout << std::fixed << std::setprecision(3);
     std::cout << "Time scalar   : " << t_scalar << " ms" << std::endl;
-    std::cout << "Time MMX      : " << t_mmx    << " ms" << std::endl;
-    std::cout << "Time MMX u=2  : " << t_u2     << " ms" << std::endl;
-    std::cout << "Time MMX u=4  : " << t_u4     << " ms" << std::endl;
-    std::cout << "Time MMX u=8  : " << t_u8     << " ms" << std::endl;
+    std::cout << "Time AVX2     : " << t_avx2   << " ms" << std::endl;
+    std::cout << "Time AVX2 u=2 : " << t_u2     << " ms" << std::endl;
+    std::cout << "Time AVX2 u=4 : " << t_u4     << " ms" << std::endl;
+    std::cout << "Time AVX2 u=8 : " << t_u8     << " ms" << std::endl;
 }
